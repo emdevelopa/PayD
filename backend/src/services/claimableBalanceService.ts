@@ -70,6 +70,17 @@ export class ClaimableBalanceService {
 
     transaction.sign(input.sponsor_keypair);
 
+    const simulation = await StellarService.simulateTransaction(transaction);
+    if (!simulation.success) {
+      throw new Error(
+        `Transaction simulation failed: ${simulation.errorMessage}. ` +
+          `This transaction would likely fail on-chain. Please check: ` +
+          `1) Sufficient balance for ${input.amount} ${input.asset_code}, ` +
+          `2) Valid account sequence, ` +
+          `3) Required trustlines.`
+      );
+    }
+
     const result = await server.submitTransaction(transaction);
 
     const balanceId = this.extractBalanceIdFromTransaction(result.hash, result.result_xdr);
@@ -324,6 +335,14 @@ export class ClaimableBalanceService {
       .build();
 
     transaction.sign(issuerKeypair);
+
+    const simulation = await StellarService.simulateTransaction(transaction);
+    if (!simulation.success) {
+      throw new Error(
+        `Transaction simulation failed: ${simulation.errorMessage}. ` +
+          `This clawback operation would likely fail. Please check the balance exists and is claimable.`
+      );
+    }
 
     const result = await server.submitTransaction(transaction);
 
