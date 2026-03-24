@@ -76,8 +76,7 @@ export function useBulkPaymentContract(contractId: string) {
     return hook.invoke({
       method: 'get_payment_status',
       args: [paymentId],
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-return
-      parseResult: (raw: unknown) => scValToNative(raw as xdr.ScVal) as unknown as TResult,
+      parseResult: (raw: unknown) => scValToNative(raw as xdr.ScVal) as BulkPaymentResult,
     });
   };
 
@@ -153,8 +152,7 @@ export function useRevenueSplitContract(contractId: string) {
     return hook.invoke({
       method: 'get_round_status',
       args: [roundId],
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-return
-      parseResult: (raw: unknown) => scValToNative(raw as xdr.ScVal) as unknown as TResult,
+      parseResult: (raw: unknown) => scValToNative(raw as xdr.ScVal) as RevenueSplitResult,
     });
   };
 
