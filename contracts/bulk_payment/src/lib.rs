@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, contractevent,
-    Address, Env, Vec, token, symbol_short, Symbol,
+    Address, Env, String, Vec, token, symbol_short, Symbol,
 };
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -30,6 +30,8 @@ pub enum ContractError {
     AlreadyRefunded      = 15,
     /// No PaymentEntry found for the given (batch_id, payment_index).
     PaymentNotFound      = 16,
+    /// Contract is paused — all payment operations are suspended.
+    ContractPaused       = 17,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -78,6 +80,13 @@ pub struct RefundIssuedEvent {
     pub payment_index: u32,
     pub sender:        Address,
     pub amount:        i128,
+}
+
+/// Emitted when the contract is paused or unpaused (circuit breaker).
+#[contractevent]
+pub struct ContractStatusChangedEvent {
+    pub paused:   bool,
+    pub admin:    Address,
 }
 
 // ── Storage types ─────────────────────────────────────────────────────────────
@@ -178,6 +187,8 @@ pub enum DataKey {
     TotalBonusesPaid,
     /// Individual payment entry: (batch_id, payment_index)
     PaymentEntry(u64, u32),
+    /// Emergency pause flag (circuit breaker)
+    Paused,
 }
 
 const MAX_BATCH_SIZE: u32 = 100;
@@ -202,6 +213,25 @@ pub struct BulkPaymentContract;
 
 #[contractimpl]
 impl BulkPaymentContract {
+    // ── SEP-0034 Contract Metadata (Issue #263) ───────────────────────────
+
+    /// Returns the human-readable contract name (SEP-0034).
+    pub fn name(env: Env) -> String {
+        String::from_str(&env, "PayD Bulk Payment")
+    }
+
+    /// Returns the contract version string (SEP-0034).
+    pub fn version(env: Env) -> String {
+        String::from_str(&env, "0.0.1")
+    }
+
+    /// Returns the contract author / organization (SEP-0034).
+    pub fn author(env: Env) -> String {
+        String::from_str(&env, "The Aha Company")
+    }
+
+    // ── Initialization ────────────────────────────────────────────────────
+
     pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError> {
         if env.storage().persistent().has(&DataKey::Admin) {
             return Err(ContractError::AlreadyInitialized);
@@ -225,6 +255,38 @@ impl BulkPaymentContract {
         Self::require_admin(&env)?;
         Self::bump_core_ttl(&env);
         Ok(())
+    }
+
+    // ── Emergency pause (circuit breaker, Issue #265) ─────────────────────
+
+    /// Pause or unpause the contract. When paused, all `execute_batch*`
+    /// operations are rejected with `ContractPaused`. Administrative
+    /// functions (set_admin, set_limits, bump_ttl) remain available.
+    ///
+    /// Only the current admin (multi-sig administrator) may call this.
+    pub fn set_paused(env: Env, paused: bool) -> Result<(), ContractError> {
+        let admin: Address = env.storage().persistent().get(&DataKey::Admin)
+            .ok_or(ContractError::NotInitialized)?;
+        env.storage().persistent().extend_ttl(
+            &DataKey::Admin, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO,
+        );
+        admin.require_auth();
+
+        env.storage().instance().set(&DataKey::Paused, &paused);
+
+        env.events().publish(
+            (symbol_short!("paused"),),
+            (paused, admin.clone()),
+        );
+
+        Ok(())
+    }
+
+    /// Returns `true` if the contract is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage().instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
     }
 
     // ── Limit management (admin-only) ─────────────────────────────────────
@@ -303,6 +365,7 @@ impl BulkPaymentContract {
         payments: Vec<PaymentOp>,
         expected_sequence: u64,
     ) -> Result<u64, ContractError> {
+        Self::require_not_paused(&env)?;
         sender.require_auth();
         Self::bump_core_ttl(&env);
         Self::check_and_advance_sequence(&env, expected_sequence)?;
@@ -363,6 +426,7 @@ impl BulkPaymentContract {
         payments: Vec<PaymentOp>,
         expected_sequence: u64,
     ) -> Result<u64, ContractError> {
+        Self::require_not_paused(&env)?;
         sender.require_auth();
         Self::bump_core_ttl(&env);
         Self::check_and_advance_sequence(&env, expected_sequence)?;
@@ -469,6 +533,7 @@ impl BulkPaymentContract {
         expected_sequence: u64,
         all_or_nothing: bool,
     ) -> Result<u64, ContractError> {
+        Self::require_not_paused(&env)?;
         sender.require_auth();
         Self::bump_core_ttl(&env);
         Self::check_and_advance_sequence(&env, expected_sequence)?;
@@ -805,6 +870,17 @@ impl BulkPaymentContract {
             &DataKey::Admin, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO,
         );
         admin.require_auth();
+        Ok(())
+    }
+
+    /// Returns `ContractPaused` if the circuit breaker is engaged.
+    fn require_not_paused(env: &Env) -> Result<(), ContractError> {
+        let paused: bool = env.storage().instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+        if paused {
+            return Err(ContractError::ContractPaused);
+        }
         Ok(())
     }
 

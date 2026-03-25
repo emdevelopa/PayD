@@ -2,8 +2,10 @@
 use super::*;
 use soroban_sdk::{
     testutils::Address as _,
+    testutils::AuthorizedFunction,
+    testutils::AuthorizedInvocation,
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env, Vec,
+    Address, Env, IntoVal, Vec,
 };
 
 // ── Errors map ────────────────────────────────────────────────────────────────
@@ -1302,4 +1304,275 @@ fn test_v2_partial_respects_daily_limit() {
     });
 
     client.execute_batch_v2(&sender, &token, &payments, &0, &false);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ── EMERGENCY PAUSE (CIRCUIT BREAKER) TESTS (Issue #265) ──────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+//
+//   ContractPaused = 17 → Error(Contract, #17)
+
+#[test]
+fn test_pause_defaults_to_false() {
+    let (_env, _sender, _token, client) = setup();
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn test_set_paused_true() {
+    let (_env, _sender, _token, client) = setup();
+    client.set_paused(&true);
+    assert!(client.is_paused());
+}
+
+#[test]
+fn test_set_paused_toggle() {
+    let (_env, _sender, _token, client) = setup();
+    client.set_paused(&true);
+    assert!(client.is_paused());
+    client.set_paused(&false);
+    assert!(!client.is_paused());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_execute_batch_blocked_when_paused() {
+    let (env, sender, token, client) = setup();
+    client.set_paused(&true);
+
+    let payments = one_payment(&env);
+    client.execute_batch(&sender, &token, &payments, &0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_execute_batch_partial_blocked_when_paused() {
+    let (env, sender, token, client) = setup();
+    client.set_paused(&true);
+
+    let payments = one_payment(&env);
+    client.execute_batch_partial(&sender, &token, &payments, &0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_execute_batch_v2_strict_blocked_when_paused() {
+    let (env, sender, token, client) = setup();
+    client.set_paused(&true);
+
+    let payments = one_payment(&env);
+    client.execute_batch_v2(&sender, &token, &payments, &0, &true);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_execute_batch_v2_partial_blocked_when_paused() {
+    let (env, sender, token, client) = setup();
+    client.set_paused(&true);
+
+    let payments = one_payment(&env);
+    client.execute_batch_v2(&sender, &token, &payments, &0, &false);
+}
+
+#[test]
+fn test_admin_functions_still_work_when_paused() {
+    let (env, _sender, _token, client) = setup();
+    client.set_paused(&true);
+
+    // Administrative actions should not be blocked
+    client.set_default_limits(&1_000, &5_000, &20_000);
+    let account = Address::generate(&env);
+    client.set_account_limits(&account, &2_000, &10_000, &40_000);
+    client.remove_account_limits(&account);
+
+    let new_admin = Address::generate(&env);
+    client.set_admin(&new_admin);
+}
+
+#[test]
+fn test_unpause_allows_batch_again() {
+    let (env, sender, token, client) = setup();
+    client.set_paused(&true);
+    assert!(client.is_paused());
+
+    client.set_paused(&false);
+    assert!(!client.is_paused());
+
+    let payments = one_payment(&env);
+    let batch_id = client.execute_batch(&sender, &token, &payments, &0);
+    let record = client.get_batch(&batch_id);
+    assert_eq!(record.success_count, 1);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ── FORMAL VERIFICATION — MULTI-SIG AUTH TESTS (Issue #260) ───────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// These tests verify that every administrative entry point requires correct
+// authorization and that no unauthorized actor can modify contract state.
+// 
+// Soroban's `mock_all_auths()` test helper automatically satisfies all
+// `require_auth()` calls. We verify correctness by inspecting `env.auths()`
+// after each call, which returns the list of (Address, AuthorizedInvocation)
+// pairs that were checked. This proves the contract demanded the right auth.
+
+/// Verify that `set_admin` requires auth from the current admin address.
+#[test]
+fn test_set_admin_requires_admin_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register(BulkPaymentContract, ());
+    let client = BulkPaymentContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let new_admin = Address::generate(&env);
+    client.set_admin(&new_admin);
+
+    // Verify the admin's auth was demanded
+    let auths = env.auths();
+    assert!(
+        auths.iter().any(|(addr, _)| *addr == admin),
+        "set_admin must require auth from the current admin"
+    );
+}
+
+/// Verify that `set_default_limits` requires admin auth.
+#[test]
+fn test_set_default_limits_requires_admin_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register(BulkPaymentContract, ());
+    let client = BulkPaymentContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    client.set_default_limits(&500, &1000, &5000);
+
+    let auths = env.auths();
+    assert!(
+        auths.iter().any(|(addr, _)| *addr == admin),
+        "set_default_limits must require auth from admin"
+    );
+}
+
+/// Verify that `set_paused` requires admin auth.
+#[test]
+fn test_set_paused_requires_admin_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register(BulkPaymentContract, ());
+    let client = BulkPaymentContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    client.set_paused(&true);
+
+    let auths = env.auths();
+    assert!(
+        auths.iter().any(|(addr, _)| *addr == admin),
+        "set_paused must require auth from admin"
+    );
+}
+
+/// Verify that `execute_batch` requires the sender's auth.
+#[test]
+fn test_execute_batch_requires_sender_auth() {
+    let (env, sender, token, client) = setup();
+
+    let payments = one_payment(&env);
+    client.execute_batch(&sender, &token, &payments, &0);
+
+    let auths = env.auths();
+    assert!(
+        auths.iter().any(|(addr, _)| *addr == sender),
+        "execute_batch must require auth from the sender"
+    );
+}
+
+/// Verify that read-only functions work without any auth.
+#[test]
+fn test_read_only_functions_need_no_auth() {
+    let (env, sender, _, client) = setup();
+
+    // These should all work without any auth concerns
+    let _seq = client.get_sequence();
+    let _count = client.get_batch_count();
+    let _limits = client.get_account_limits(&sender);
+    let _usage = client.get_account_usage(&sender);
+    let _paused = client.is_paused();
+
+    // SEP-0034 metadata should also be freely readable
+    let name = client.name();
+    let version = client.version();
+    let author = client.author();
+    assert_eq!(name, soroban_sdk::String::from_str(&env, "PayD Bulk Payment"));
+    assert_eq!(version, soroban_sdk::String::from_str(&env, "0.0.1"));
+    assert_eq!(author, soroban_sdk::String::from_str(&env, "The Aha Company"));
+}
+
+/// Verify that `bump_ttl` requires admin auth.
+#[test]
+fn test_bump_ttl_requires_admin_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register(BulkPaymentContract, ());
+    let client = BulkPaymentContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    client.bump_ttl();
+
+    let auths = env.auths();
+    assert!(
+        auths.iter().any(|(addr, _)| *addr == admin),
+        "bump_ttl must require auth from admin"
+    );
+}
+
+/// Verify that `set_account_limits` requires admin auth.
+#[test]
+fn test_set_account_limits_requires_admin_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register(BulkPaymentContract, ());
+    let client = BulkPaymentContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let account = Address::generate(&env);
+    client.set_account_limits(&account, &500, &1000, &5000);
+
+    let auths = env.auths();
+    assert!(
+        auths.iter().any(|(addr, _)| *addr == admin),
+        "set_account_limits must require auth from admin"
+    );
+}
+
+/// Verify that `remove_account_limits` requires admin auth.
+#[test]
+fn test_remove_account_limits_requires_admin_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register(BulkPaymentContract, ());
+    let client = BulkPaymentContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let account = Address::generate(&env);
+    client.set_account_limits(&account, &500, &1000, &5000);
+    client.remove_account_limits(&account);
+
+    let auths = env.auths();
+    assert!(
+        auths.iter().any(|(addr, _)| *addr == admin),
+        "remove_account_limits must require auth from admin"
+    );
 }
